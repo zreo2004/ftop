@@ -5,6 +5,9 @@ import os
 
 /// Looks for a newer release and replaces the installed app with it.
 ///
+/// An app built from a checkout instead builds itself again from that checkout: its
+/// releases are Apple Silicon only, so there is no archive for it to download.
+///
 /// Only the app bundle the panel runs from is replaced. The setuid helper that
 /// `sudo ftop grant` installed is outside the bundle and is never touched, so an
 /// update cannot change what runs as root.
@@ -13,8 +16,18 @@ final class Updater {
     enum State: Equatable {
         case idle, checking, upToDate
         case available(AppVersion)
+        /// A checkout that is behind the branch it follows, with the subject of the newest commit.
+        case sourceAvailable(String)
         case installing(AppVersion)
+        case rebuilding
         case failed(String)
+    }
+
+    /// The checkout this app was built from; nil when it came from a release archive.
+    struct SourceBuild: Equatable {
+        var root: URL
+        /// The commit the installed app was built from, when the bundle names one.
+        var commit: String?
     }
 
     private(set) var state = State.idle {
@@ -26,6 +39,7 @@ final class Updater {
     var willRelaunch: (() -> Void)?
 
     private var found: ReleaseInfo?
+    private var foundSource: String?
     private var busy = false
     private let log = Logger(subsystem: "dev.ftop", category: "update")
     private static let lastCheckKey = "lastUpdateCheck"
@@ -41,6 +55,111 @@ final class Updater {
             && FileManager.default.isWritableFile(atPath: bundle.deletingLastPathComponent().path)
     }
 
+    /// The checkout a local build was made from, read from the bundle's own Info.plist.
+    /// A release archive has neither key, so it stays on the download path.
+    static let sourceBuild: SourceBuild? = {
+        guard let info = Bundle.main.infoDictionary, let path = info["FtopSourceRoot"] as? String, path.hasPrefix("/") else { return nil }
+        let root = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: root.appending(path: "Package.swift").path) else { return nil }
+        return SourceBuild(root: root, commit: (info["FtopBuildCommit"] as? String)?.split(separator: "-").first.map(String.init))
+    }()
+
+    /// The last line the source build wrote, for the settings row while it runs.
+    private(set) var progress: String?
+
+    /// `git fetch` in the checkout. Nil when the app already holds what the branch has,
+    /// else the subject of the newest commit it does not. Measured from the commit the
+    /// app was built from, not from the checkout's HEAD: a build that failed has left the
+    /// checkout ahead of the app, and that is still an update to make.
+    private func fetchSource() async -> Result<String?, Failure> {
+        guard let source = Self.sourceBuild else { return .failure(Failure("this app was not built from a checkout")) }
+        do {
+            _ = try await Self.run(Self.git, ["fetch", "--quiet", "origin"], in: source.root)
+            guard let built = source.commit else {
+                // Nothing says what this copy holds, so it is built again from the checkout.
+                let subject = try await Self.run(Self.git, ["log", "-1", "--format=%s", "FETCH_HEAD"], in: source.root)
+                return .success(subject.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            let ahead = try await Self.run(Self.git, ["rev-list", "--count", "\(built)..FETCH_HEAD"], in: source.root)
+            guard (Int(ahead.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0) > 0 else { return .success(nil) }
+            // The checkout is merged by the build script, never by the panel, so this only reports.
+            let subject = try await Self.run(Self.git, ["log", "-1", "--format=%s", "FETCH_HEAD"], in: source.root).trimmingCharacters(in: .whitespacesAndNewlines)
+            return .success(subject)
+        } catch {
+            return .failure(error as? Failure ?? Failure(error.localizedDescription))
+        }
+    }
+
+    /// Runs the checkout's build script and restarts into what it installs. The script
+    /// is `scripts/rebuild.sh`: it fetches, merges, builds for this machine's
+    /// architecture, replaces the installed app, and relaunches it.
+    func rebuildFromSource() async {
+        guard !busy, let source = Self.sourceBuild else { return }
+        busy = true
+        defer { busy = false }
+        state = .rebuilding
+        progress = nil
+        do {
+            let script = source.root.appending(path: "scripts/rebuild.sh")
+            guard FileManager.default.isExecutableFile(atPath: script.path) else {
+                throw Failure("this checkout has no scripts/rebuild.sh; pull it, then build again")
+            }
+            _ = try await Self.run(
+                script.path, [], in: source.root,
+                extra: ["FTOP_REBUILD_TARGET": Bundle.main.bundleURL.path]
+            ) { [weak self] line in
+                guard !line.isEmpty else { return }
+                self?.progress = line
+                self?.onChange?()
+            }
+            progress = nil
+            try relaunch(Bundle.main.bundleURL)
+        } catch {
+            progress = nil
+            fail(error)
+        }
+    }
+
+    private static let git = "/usr/bin/git"
+
+    /// Runs a tool to completion, returning what it printed. `onLine` gets the last line
+    /// of each read, which is what a long build is worth showing while it runs.
+    private nonisolated static func run(
+        _ tool: String, _ arguments: [String], in directory: URL, extra: [String: String] = [:],
+        onLine: @escaping @MainActor @Sendable (String) -> Void = { _ in }
+    ) async throws -> String {
+        try await Task.detached {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: tool)
+            task.arguments = arguments
+            task.currentDirectoryURL = directory
+            var environment = ProcessInfo.processInfo.environment
+            // A GUI app starts without the shell's PATH, and the build script needs swift.
+            environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
+            environment.merge(extra) { _, added in added }
+            task.environment = environment
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = pipe
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                let line = text.split(whereSeparator: \.isNewline).last.map(String.init) ?? ""
+                Task { @MainActor in onLine(line) }
+            }
+            defer { pipe.fileHandleForReading.readabilityHandler = nil }
+            try task.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            task.waitUntilExit()
+            let output = String(decoding: data, as: UTF8.self)
+            guard task.terminationStatus == 0 else {
+                let reason = output.split(whereSeparator: \.isNewline).last.map(String.init) ?? "\(tool) failed with status \(task.terminationStatus)"
+                throw Failure(reason)
+            }
+            return output
+        }.value
+    }
+
     /// The daily check: does nothing when updates are off or the last check is recent.
     func checkIfDue() {
         guard mode != .off, Self.current != nil else { return }
@@ -49,8 +168,44 @@ final class Updater {
         Task { await check(install: mode == .install) }
     }
 
-    /// Asks the release server now. `install` also installs what it finds.
+    /// Looks for a newer version now, where this copy came from: the checkout it was
+    /// built from, or the release server. `install` also installs what it finds.
     func check(install: Bool) async {
+        if Self.sourceBuild != nil { await checkSource() } else { await checkRelease(install: install) }
+    }
+
+    /// Asks the checkout's origin whether the branch has moved. The setting decides
+    /// whether a newer checkout is rebuilt at once or only offered.
+    func checkSource() async {
+        guard !busy else { return }
+        busy = true
+        defer { busy = false }
+        state = .checking
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastCheckKey)
+        switch await fetchSource() {
+        case .failure(let error): fail(error)
+        case .success(let subject?):
+            foundSource = subject
+            state = .sourceAvailable(subject)
+            // Only a newer checkout is rebuilt on its own, and only when the setting says so.
+            if mode == .install {
+                busy = false
+                await rebuildFromSource()
+            }
+        case .success(nil):
+            foundSource = nil
+            state = .upToDate
+        }
+    }
+
+    /// Rebuilds and installs the checkout the last check found newer.
+    func rebuildFound() {
+        guard foundSource != nil, !busy else { return }
+        Task { await rebuildFromSource() }
+    }
+
+    /// Asks the release server now. `install` also installs what it finds.
+    func checkRelease(install: Bool) async {
         guard !busy, let current = Self.current else { return }
         busy = true
         defer { busy = false }

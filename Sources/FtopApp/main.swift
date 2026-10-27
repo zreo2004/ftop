@@ -106,8 +106,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case .checking: Strings.pick("checking…", "正在检查…")
             case .upToDate: Strings.pick("up to date", "已是最新")
             case .available(let found): Strings.pick("\(found) available", "可更新到 \(found)")
+            case .sourceAvailable(let subject): Strings.pick("source updated: \(subject)", "源码有更新：\(subject)")
             case .installing(let found): Strings.pick("installing \(found)…", "正在安装 \(found)…")
-            case .failed: Strings.pick("could not check", "检查失败")
+            case .rebuilding: updater.progress ?? Strings.pick("rebuilding…", "正在重新编译…")
+            // The reason is what tells a failed build from a failed download; the menu
+            // shows it in full, where the settings row has no room.
+            case .failed(let reason): Strings.pick("could not update: \(reason)", "更新失败：\(reason)")
             }
         return detail.map { version + " · " + $0 } ?? version
     }
@@ -115,15 +119,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// The button beside it: install what was found, else look.
     private var updateAction: String {
         if case .available(let found) = updater.state, Updater.canInstall { return Strings.pick("Install \(found)", "安装 \(found)") }
+        if case .sourceAvailable = updater.state { return Strings.pick("Rebuild", "重新编译") }
         return Strings.pick("Check Now", "立即检查")
     }
 
     /// The settings button: installs only when asked to, or when that is the setting.
     private func updateButtonPressed() {
-        if case .available = updater.state {
-            updater.installFound()
-        } else {
-            Task { await updater.check(install: model.config.updates == .install) }
+        switch updater.state {
+        case .available: updater.installFound()
+        case .sourceAvailable: updater.rebuildFound()
+        default: Task { await updater.check(install: model.config.updates == .install) }
         }
     }
 
