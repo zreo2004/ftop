@@ -74,7 +74,8 @@ final class Updater {
     private func fetchSource() async -> Result<String?, Failure> {
         guard let source = Self.sourceBuild else { return .failure(Failure("this app was not built from a checkout")) }
         do {
-            _ = try await Self.run(Self.git, ["fetch", "--quiet", "origin"], in: source.root)
+            // A fork's origin is the fork itself, so its upstream is the one that moves.
+            _ = try await Self.run(Self.git, ["fetch", "--quiet", "upstream"], in: source.root)
             guard let built = source.commit else {
                 // Nothing says what this copy holds, so it is built again from the checkout.
                 let subject = try await Self.run(Self.git, ["log", "-1", "--format=%s", "FETCH_HEAD"], in: source.root)

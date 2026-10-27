@@ -7,6 +7,8 @@
 # itself afterwards; running it by hand only replaces the app.
 #
 # FTOP_REBUILD_TARGET names the app bundle to replace (default ~/Applications/Ftop.app).
+# FTOP_REBUILD_REMOTE names the remote to take new commits from (default upstream when
+# the checkout has one, else origin): a fork's origin is the fork itself.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -14,13 +16,18 @@ target="${FTOP_REBUILD_TARGET:-$HOME/Applications/Ftop.app}"
 [ -d "$target" ] || { echo "No app at $target" >&2; exit 1; }
 [ -w "$(dirname "$target")" ] || { echo "$(dirname "$target") is not writable" >&2; exit 1; }
 
-echo "== fetch"
-git fetch --quiet origin
+remote="${FTOP_REBUILD_REMOTE:-}"
+if [ -z "$remote" ]; then
+    if git remote get-url upstream >/dev/null 2>&1; then remote=upstream; else remote=origin; fi
+fi
+
+echo "== fetch $remote"
+git fetch --quiet "$remote"
 if [ "$(git rev-parse HEAD)" != "$(git rev-parse FETCH_HEAD)" ]; then
     # A checkout that has diverged is merged by hand: building it again would only
     # produce the same app, once a day, for as long as the two stay apart.
     git merge --ff-only --quiet FETCH_HEAD || {
-        echo "This checkout has commits of its own; merge origin/main by hand, then build again." >&2
+        echo "This checkout has commits of its own; merge $remote/main by hand, then build again." >&2
         exit 1
     }
 fi
